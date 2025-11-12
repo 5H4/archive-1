@@ -1,0 +1,146 @@
+import sys
+import os
+import re
+from collections import Counter
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog, QHBoxLayout
+from PyQt5.QtGui import QPixmap
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyPDF2 import PdfReader, PdfWriter
+import pygame  # za muziku
+
+
+# ---------------- Resource helper ------------------
+def resource_path(relative_path):
+    """ Vrati ispravan put za PyInstaller ili lokalno """
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
+
+# ---------------- PDF funkcije ------------------
+def extract_sku_from_text(text):
+    lines = text.split("\n")
+    sku_lines = [line.strip() for line in lines if re.match(r"^\d+\s*-\s*[A-Z0-9]+", line.strip())]
+    return sku_lines[-1] if sku_lines else None
+
+
+def sort_pdf_pages_by_frequency(input_path):
+    reader = PdfReader(input_path)
+    pages_info = []
+
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text() or ""
+        sku = extract_sku_from_text(text)
+        pages_info.append({"index": i, "sku": sku or ""})
+
+    sku_counter = Counter([p["sku"] for p in pages_info])
+    pages_info.sort(key=lambda p: sku_counter[p["sku"]], reverse=True)
+
+    writer = PdfWriter()
+    for p in pages_info:
+        writer.add_page(reader.pages[p["index"]])
+
+    output_path = os.path.splitext(input_path)[0] + "_sorted.pdf"
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+    return output_path
+
+
+# ---------------- Worker nit ------------------
+class PDFWorker(QThread):
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        try:
+            output = sort_pdf_pages_by_frequency(self.file_path)
+            self.finished.emit(output)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ------------------ GUI ------------------
+class PDFSorter(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+        self.worker = None
+
+    def initUI(self):
+        self.setWindowTitle("Sortiranje nalepk po SKU")
+        self.resize(500, 110)
+
+        main_layout = QVBoxLayout()
+        main_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+
+        self.label = QLabel("Izberi PDF datoteko za sortiranje:")
+        self.label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.label)
+
+        self.button = QPushButton("📂 Izberi PDF in sortiraj")
+        self.button.clicked.connect(self.sort_pdf)
+        main_layout.addWidget(self.button)
+
+        self.status = QLabel("")
+        self.status.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.status)
+
+        # 🔹 Dodaj developer linkove u donji desni ugao
+        link_label = QLabel()
+        link_label.setText(
+            '<a href="https://www.linkedin.com/in/ramotoric/" style="text-decoration:none;">'
+            '<span style="color:#0077b5;">LinkedIn</span></a>  |  '
+            '<a href="https://github.com/5H4" style="text-decoration:none;">'
+            '<span style="color:#333;">GitHub</span></a>'
+        )
+        link_label.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+        link_label.setOpenExternalLinks(True)
+
+        # Dodaj horizontalni layout za poravnanje
+        bottom_layout = QHBoxLayout()
+        bottom_layout.addStretch()
+        bottom_layout.addWidget(link_label)
+
+        main_layout.addLayout(bottom_layout)
+        self.setLayout(main_layout)
+
+    def sort_pdf(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Izberi PDF datoteko", "", "PDF datoteke (*.pdf)"
+        )
+        if file_path:
+            self.status.setText("⏳ Sortiram PDF... prosim počakaj...")
+            self.button.setEnabled(False)
+
+            self.worker = PDFWorker(file_path)
+            self.worker.finished.connect(self.on_sort_done)
+            self.worker.error.connect(self.on_sort_error)
+            self.worker.start()
+
+    def on_sort_done(self, output_path):
+        self.status.setText(f"✅ Sortirano in shranjeno: {output_path}")
+        self.button.setEnabled(True)
+
+    def on_sort_error(self, error_message):
+        self.status.setText(f"❌ Napaka: {error_message}")
+        self.button.setEnabled(True)
+
+    def play_background_music(self):
+        mp3_path = resource_path("play.mp3")
+        if os.path.exists(mp3_path):
+            pygame.mixer.init()
+            pygame.mixer.music.load(mp3_path)
+            pygame.mixer.music.play(-1)
+
+
+# ------------------ Pokreni GUI ------------------
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    ex = PDFSorter()
+    ex.show()
+    sys.exit(app.exec_())
