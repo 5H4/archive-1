@@ -1,21 +1,14 @@
 import sys
 import os
 import re
-from collections import Counter
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QLabel, QFileDialog, QHBoxLayout
-from PyQt5.QtGui import QPixmap
+from collections import Counter, defaultdict
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QPushButton,
+    QLabel, QFileDialog, QTextEdit, QHBoxLayout, QMessageBox
+)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
 from PyPDF2 import PdfReader, PdfWriter
-import pygame  # za muziku
-
-
-# ---------------- Resource helper ------------------
-def resource_path(relative_path):
-    """ Vrati ispravan put za PyInstaller ili lokalno """
-    if hasattr(sys, "_MEIPASS"):
-        return os.path.join(sys._MEIPASS, relative_path)
-    return os.path.join(os.path.abspath("."), relative_path)
-
 
 # ---------------- PDF funkcije ------------------
 def extract_sku_from_text(text):
@@ -23,36 +16,12 @@ def extract_sku_from_text(text):
     sku_lines = [line.strip() for line in lines if re.match(r"^\d+\s*-\s*[A-Z0-9\s-]+", line.strip())]
     if not sku_lines:
         return None
-
-    # ✅ Uzimamo zadnju SKU liniju
     sku = sku_lines[-1].strip()
-
-    # ✅ Normalizacija kombinacija (npr. "1 - FABM, 1 - SAF116" == "1 - SAF116, 1 - FABM")
     parts = [p.strip() for p in sku.split(",") if p.strip()]
     normalized = ", ".join(sorted(parts))
-
     return normalized
 
-
-
-def sort_pdf_pages_by_frequency(input_path):
-    from PyPDF2 import PdfReader, PdfWriter
-    from collections import Counter
-    import re
-
-    def extract_sku_from_text(text):
-        lines = text.split("\n")
-        sku_lines = [line.strip() for line in lines if re.match(r"^\d+\s*-\s*[A-Z0-9]+", line.strip())]
-        if not sku_lines:
-            return None
-
-        sku = sku_lines[-1].strip()
-        # 🔹 Normalizuj tako da "1 - FABM, 1 - SAF116" == "1 - SAF116, 1 - FABM"
-        parts = re.split(r"\s*,\s*", sku)
-        parts = sorted(part.strip() for part in parts)
-        normalized = ", ".join(parts)
-        return normalized
-
+def sort_pdf_pages_and_count_sku(input_path):
     reader = PdfReader(input_path)
     pages_info = []
 
@@ -61,18 +30,10 @@ def sort_pdf_pages_by_frequency(input_path):
         sku = extract_sku_from_text(text)
         pages_info.append({"index": i, "sku": sku or ""})
 
-    # 🔹 Broji pojavljivanja svake kombinacije SKU-a
     sku_counter = Counter(p["sku"] for p in pages_info)
-
-    # 🔹 Sortiraj po učestalosti, ali tako da kombinacije budu grupisane
     pages_info.sort(key=lambda p: (sku_counter[p["sku"]], p["sku"]), reverse=True)
 
-    # 🔹 Debug ispis
-    print("\n=== SORTIRANJE DEBUG ===")
-    for idx, p in enumerate(pages_info, 1):
-        print(f"{idx}. Stranica {p['index']+1} -> SKU: {p['sku']} ({sku_counter[p['sku']]}x)")
-
-    # 🔹 Kreiraj novi PDF
+    # Kreiraj sortirani PDF
     writer = PdfWriter()
     for p in pages_info:
         writer.add_page(reader.pages[p["index"]])
@@ -81,14 +42,11 @@ def sort_pdf_pages_by_frequency(input_path):
     with open(output_path, "wb") as f:
         writer.write(f)
 
-    return output_path
-
-
-
+    return pages_info, output_path
 
 # ---------------- Worker nit ------------------
 class PDFWorker(QThread):
-    finished = pyqtSignal(str)
+    finished = pyqtSignal(list, str)
     error = pyqtSignal(str)
 
     def __init__(self, file_path):
@@ -97,85 +55,150 @@ class PDFWorker(QThread):
 
     def run(self):
         try:
-            output = sort_pdf_pages_by_frequency(self.file_path)
-            self.finished.emit(output)
+            pages_info, output_path = sort_pdf_pages_and_count_sku(self.file_path)
+            self.finished.emit(pages_info, output_path)
         except Exception as e:
             self.error.emit(str(e))
-
 
 # ------------------ GUI ------------------
 class PDFSorter(QWidget):
     def __init__(self):
         super().__init__()
-        self.initUI()
         self.worker = None
+        self.pages_info = []
+        self.sorted_pdf_path = ""
+        self.doc_name = ""
+        self.initUI()
 
     def initUI(self):
-        self.setWindowTitle("Sortiranje nalepk po SKU")
-        self.resize(500, 110)
+        self.setWindowTitle("Sortiranje PDF in Pickup lista")
+        self.resize(700, 600)
 
         main_layout = QVBoxLayout()
-        main_layout.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
 
-        self.label = QLabel("Izberi PDF datoteko za sortiranje:")
-        self.label.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(self.label)
-
-        self.button = QPushButton("📂 Izberi PDF in sortiraj")
-        self.button.clicked.connect(self.sort_pdf)
-        main_layout.addWidget(self.button)
-
-        self.status = QLabel("")
+        # Status label
+        self.status = QLabel("Izberi PDF datoteko za sortiranje:")
         self.status.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(self.status)
 
-        # 🔹 Dodaj developer linkove u donji desni ugao
-        link_label = QLabel()
-        link_label.setText(
+        # Dugme za sortiranje
+        self.sort_button = QPushButton("📂 Izberi PDF in sortiraj")
+        self.sort_button.clicked.connect(self.select_pdf)
+        main_layout.addWidget(self.sort_button)
+
+        # Text preview za pickup listu (HTML)
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        main_layout.addWidget(self.preview)
+
+        # Dugme za print pickup liste
+        self.print_pick_button = QPushButton("🖨️ Natisni Pickup listo")
+        self.print_pick_button.clicked.connect(self.print_pick_list)
+        main_layout.addWidget(self.print_pick_button)
+
+        # Developer linkovi
+        link_layout = QHBoxLayout()
+        link_layout.addStretch()
+        self.link_label = QLabel()
+        self.link_label.setText(
             '<a href="https://www.linkedin.com/in/ramotoric/" style="text-decoration:none;">'
             '<span style="color:#0077b5;">LinkedIn</span></a>  |  '
             '<a href="https://github.com/5H4" style="text-decoration:none;">'
             '<span style="color:#333;">GitHub</span></a>'
         )
-        link_label.setAlignment(Qt.AlignRight | Qt.AlignBottom)
-        link_label.setOpenExternalLinks(True)
+        self.link_label.setOpenExternalLinks(True)
+        link_layout.addWidget(self.link_label)
+        main_layout.addLayout(link_layout)
 
-        # Dodaj horizontalni layout za poravnanje
-        bottom_layout = QHBoxLayout()
-        bottom_layout.addStretch()
-        bottom_layout.addWidget(link_label)
-
-        main_layout.addLayout(bottom_layout)
         self.setLayout(main_layout)
 
-    def sort_pdf(self):
+    def select_pdf(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Izberi PDF datoteko", "", "PDF datoteke (*.pdf)"
         )
         if file_path:
+            self.doc_name = os.path.basename(file_path)
             self.status.setText("⏳ Sortiram PDF... prosim počakaj...")
-            self.button.setEnabled(False)
-
+            self.sort_button.setEnabled(False)
             self.worker = PDFWorker(file_path)
             self.worker.finished.connect(self.on_sort_done)
             self.worker.error.connect(self.on_sort_error)
             self.worker.start()
 
-    def on_sort_done(self, output_path):
-        self.status.setText(f"✅ Sortirano in shranjeno: {output_path}")
-        self.button.setEnabled(True)
+    def on_sort_done(self, pages_info, sorted_pdf_path):
+        self.pages_info = pages_info
+        self.sorted_pdf_path = sorted_pdf_path
+        self.status.setText(f"✅ PDF sortiran in shranjen: {sorted_pdf_path}")
+        self.sort_button.setEnabled(True)
+        self.show_pick_list_html()
+
+        # Ponudi opciju za print sortirani PDF
+        reply = QMessageBox.question(
+            self, "PDF Sortiran", "Ali želite natisniti sortirani PDF?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.print_pdf_dialog(sorted_pdf_path)
 
     def on_sort_error(self, error_message):
         self.status.setText(f"❌ Napaka: {error_message}")
-        self.button.setEnabled(True)
+        self.sort_button.setEnabled(True)
 
-    def play_background_music(self):
-        mp3_path = resource_path("play.mp3")
-        if os.path.exists(mp3_path):
-            pygame.mixer.init()
-            pygame.mixer.music.load(mp3_path)
-            pygame.mixer.music.play(-1)
+    def show_pick_list_html(self):
+        if not self.pages_info:
+            return
 
+        total_counts = defaultdict(int)
+        for page in self.pages_info:
+            sku_str = page["sku"]
+            if not sku_str:
+                continue
+            for part in sku_str.split(","):
+                match = re.match(r"(\d+)\s*-\s*([A-Z0-9]+)", part.strip())
+                if match:
+                    qty, sku = match.groups()
+                    total_counts[sku] += int(qty)
+
+        sorted_items = sorted(total_counts.items(), key=lambda x: x[1], reverse=True)
+
+        html = f"<h2>Pickup lista za dokument: {self.doc_name}</h2>"
+        html += """
+        <table border="1" cellspacing="0" cellpadding="4">
+        <tr style="background-color: #d3d3d3;">
+            <th>Št.</th>
+            <th>SKU</th>
+            <th>Količina</th>
+        </tr>
+        """
+        for i, (sku, qty) in enumerate(sorted_items, 1):
+            html += f"<tr><td>{i}</td><td>{sku}</td><td>{qty}</td></tr>"
+        html += "</table>"
+        self.preview.setHtml(html)
+
+    def print_pick_list(self):
+        if self.preview.toPlainText().strip() == "":
+            return
+        printer = QPrinter()
+        dialog = QPrintDialog(printer, self)
+        if dialog.exec_() == QPrintDialog.Accepted:
+            self.preview.print_(printer)
+            self.status.setText("🖨️ Pickup listo poslana na tiskalnik.")
+
+    def print_pdf_dialog(self, pdf_path):
+        try:
+            printer = QPrinter()
+            dialog = QPrintDialog(printer, self)
+            if dialog.exec_() == QPrintDialog.Accepted:
+                # sistemski print na odabrani printer
+                if sys.platform.startswith('linux'):
+                    os.system(f"lp '{pdf_path}'")
+                elif sys.platform == 'win32':
+                    os.startfile(pdf_path, "print")
+                elif sys.platform == 'darwin':
+                    os.system(f"lp '{pdf_path}'")
+                self.status.setText(f"🖨️ PDF poslan na tiskalnik: {pdf_path}")
+        except Exception as e:
+            self.status.setText(f"❌ Napaka pri tiskanju PDF: {str(e)}")
 
 # ------------------ Pokreni GUI ------------------
 if __name__ == '__main__':
