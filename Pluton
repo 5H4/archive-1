@@ -20,21 +20,39 @@ def resource_path(relative_path):
 # ---------------- PDF funkcije ------------------
 def extract_sku_from_text(text):
     lines = text.split("\n")
-    sku_lines = [line.strip() for line in lines if re.match(r"^\d+\s*[A-Z0-9\s-]+", line.strip())]
+    sku_lines = [line.strip() for line in lines if re.match(r"^\d+\s*-\s*[A-Z0-9\s-]+", line.strip())]
     if not sku_lines:
         return None
 
-    # Uzmemo zadnju liniju
+    # ✅ Uzimamo zadnju SKU liniju
     sku = sku_lines[-1].strip()
 
-    # Normalizacija: razbij po razmacima, sortiraj, spoji
-    parts = re.split(r"\s+", sku)
-    normalized = " ".join(sorted(parts))
+    # ✅ Normalizacija kombinacija (npr. "1 - FABM, 1 - SAF116" == "1 - SAF116, 1 - FABM")
+    parts = [p.strip() for p in sku.split(",") if p.strip()]
+    normalized = ", ".join(sorted(parts))
 
     return normalized
 
 
+
 def sort_pdf_pages_by_frequency(input_path):
+    from PyPDF2 import PdfReader, PdfWriter
+    from collections import Counter
+    import re
+
+    def extract_sku_from_text(text):
+        lines = text.split("\n")
+        sku_lines = [line.strip() for line in lines if re.match(r"^\d+\s*-\s*[A-Z0-9]+", line.strip())]
+        if not sku_lines:
+            return None
+
+        sku = sku_lines[-1].strip()
+        # 🔹 Normalizuj tako da "1 - FABM, 1 - SAF116" == "1 - SAF116, 1 - FABM"
+        parts = re.split(r"\s*,\s*", sku)
+        parts = sorted(part.strip() for part in parts)
+        normalized = ", ".join(parts)
+        return normalized
+
     reader = PdfReader(input_path)
     pages_info = []
 
@@ -43,9 +61,18 @@ def sort_pdf_pages_by_frequency(input_path):
         sku = extract_sku_from_text(text)
         pages_info.append({"index": i, "sku": sku or ""})
 
-    sku_counter = Counter([p["sku"] for p in pages_info])
-    pages_info.sort(key=lambda p: sku_counter[p["sku"]], reverse=True)
+    # 🔹 Broji pojavljivanja svake kombinacije SKU-a
+    sku_counter = Counter(p["sku"] for p in pages_info)
 
+    # 🔹 Sortiraj po učestalosti, ali tako da kombinacije budu grupisane
+    pages_info.sort(key=lambda p: (sku_counter[p["sku"]], p["sku"]), reverse=True)
+
+    # 🔹 Debug ispis
+    print("\n=== SORTIRANJE DEBUG ===")
+    for idx, p in enumerate(pages_info, 1):
+        print(f"{idx}. Stranica {p['index']+1} -> SKU: {p['sku']} ({sku_counter[p['sku']]}x)")
+
+    # 🔹 Kreiraj novi PDF
     writer = PdfWriter()
     for p in pages_info:
         writer.add_page(reader.pages[p["index"]])
@@ -55,6 +82,8 @@ def sort_pdf_pages_by_frequency(input_path):
         writer.write(f)
 
     return output_path
+
+
 
 
 # ---------------- Worker nit ------------------
