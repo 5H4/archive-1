@@ -20,8 +20,18 @@ def resource_path(relative_path):
 # ---------------- PDF funkcije ------------------
 def extract_sku_from_text(text):
     lines = text.split("\n")
-    sku_lines = [line.strip() for line in lines if re.match(r"^\d+\s*-\s*[A-Z0-9]+", line.strip())]
-    return sku_lines[-1] if sku_lines else None
+    sku_lines = [line.strip() for line in lines if re.match(r"^\d+\s*[A-Z0-9\s-]+", line.strip())]
+    if not sku_lines:
+        return None
+
+    # Uzmemo zadnju liniju
+    sku = sku_lines[-1].strip()
+
+    # Normalizacija: razbij po razmacima, sortiraj, spoji
+    parts = re.split(r"\s+", sku)
+    normalized = " ".join(sorted(parts))
+
+    return normalized
 
 
 def sort_pdf_pages_by_frequency(input_path):
