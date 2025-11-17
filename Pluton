@@ -10,32 +10,46 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
 from PyPDF2 import PdfReader, PdfWriter
 
+import pdfplumber
+
 # ---------------- PDF funkcije ------------------
 def extract_sku_from_text(text):
-    lines = text.split("\n")
+    # Zamijeni nove linije razmakom
+    text = text.replace("\n", " ")
     
-    # Uzima linije koje sadrže broj, space, minus, space, pa onda kod
-    sku_lines = [line.strip() for line in lines if re.search(r"\b\d+\s-\s[A-Z0-9]+", line)]
-    
-    if not sku_lines:
+    # Regex: pronalazi sekvencu npr. "1 - ABC, 2 - XYZ, 3 - AAA"
+    pattern = r'\d+ - [A-Z0-9]+(?:, \d+ - [A-Z0-9]+)*'    
+    match = re.search(pattern, text)
+    if not match:
+        print(text)
+        sleep(100)
         return None
     
-    sku = sku_lines[-1].strip()
-    parts = [p.strip() for p in sku.split(",") if p.strip()]
+    sku_block = match.group(0)
+
+    #Extract debugger
+    print(sku_block)
+    
+    # Razdvoji pojedinačne SKU-ove
+    parts = [p.strip() for p in sku_block.split(",") if p.strip()]
+    
+    # Sortiraj i vrati finalni string
     normalized = ", ".join(sorted(parts))
     return normalized
 
-
-def sort_pdf_pages_and_count_sku(input_path):
+def sort_pdf_pages_and_count_sku(input_path, crop_bottom = 250):
     reader = PdfReader(input_path)
     pages_info = []
 
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        sku = extract_sku_from_text(text)
-        pages_info.append({"index": i, "sku": sku or ""})
+    with pdfplumber.open(input_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            bbox = (0, page.height - crop_bottom, page.width, page.height)
+            text = page.within_bbox(bbox).extract_text() or ""
+            sku = extract_sku_from_text(text)
+            pages_info.append({"index": i, "sku": sku or ""})
 
     sku_counter = Counter(p["sku"] for p in pages_info)
+    print(sku_counter)
     pages_info.sort(key=lambda p: (sku_counter[p["sku"]], p["sku"]), reverse=True)
 
     # Kreiraj sortirani PDF
