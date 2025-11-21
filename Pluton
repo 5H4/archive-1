@@ -6,38 +6,55 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
     QLabel, QFileDialog, QTextEdit, QHBoxLayout, QMessageBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt5.QtGui import QPixmap, QImage, QPainter, QColor, QPen
 from PyQt5.QtPrintSupport import QPrinter, QPrintDialog
 from PyPDF2 import PdfReader, PdfWriter
-
+import fitz  # PyMuPDF za preview
 import pdfplumber
+
+# ------------------ Debug funkcija i prozor ------------------
+class DebugWindow(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Debug Output")
+        self.resize(600, 300)
+        layout = QVBoxLayout()
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        layout.addWidget(self.text_edit)
+        self.setLayout(layout)
+
+    def log(self, message):
+        self.text_edit.append(message)
+        self.text_edit.verticalScrollBar().setValue(
+            self.text_edit.verticalScrollBar().maximum()
+        )
+
+debug_window = None
+def debug_print(message):
+    if debug_window:
+        debug_window.log(message)
+
+class DebugSignal(QObject):
+    new_message = pyqtSignal(str)
+
+debug_signal = DebugSignal()
 
 # ---------------- PDF funkcije ------------------
 def extract_sku_from_text(text):
-    # Zamijeni nove linije razmakom
     text = text.replace("\n", " ")
-    
-    # Regex: pronalazi sekvencu npr. "1 - ABC, 2 - XYZ, 3 - AAA"
-    pattern = r'\d+ - [A-Z0-9]+(?:, \d+ - [A-Z0-9]+)*'    
+    pattern = r'\d+ - [A-Za-z0-9\-]+(?:, \d+ - [A-Za-z0-9\-]+)*'
     match = re.search(pattern, text)
     if not match:
         print(text)
-        sleep(100)
         return None
-    
     sku_block = match.group(0)
-
-    #Extract debugger
-    print(sku_block)
-    
-    # Razdvoji pojedinačne SKU-ove
     parts = [p.strip() for p in sku_block.split(",") if p.strip()]
-    
-    # Sortiraj i vrati finalni string
     normalized = ", ".join(sorted(parts))
     return normalized
 
-def sort_pdf_pages_and_count_sku(input_path, crop_bottom = 250):
+def sort_pdf_pages_and_count_sku(input_path, crop_bottom=50):
     reader = PdfReader(input_path)
     pages_info = []
 
@@ -46,13 +63,12 @@ def sort_pdf_pages_and_count_sku(input_path, crop_bottom = 250):
             bbox = (0, page.height - crop_bottom, page.width, page.height)
             text = page.within_bbox(bbox).extract_text() or ""
             sku = extract_sku_from_text(text)
+            debug_signal.new_message.emit(f"Page {i+1} SKU: [{sku}]")
             pages_info.append({"index": i, "sku": sku or ""})
 
     sku_counter = Counter(p["sku"] for p in pages_info)
-    print(sku_counter)
     pages_info.sort(key=lambda p: (sku_counter[p["sku"]], p["sku"]), reverse=True)
 
-    # Kreiraj sortirani PDF
     writer = PdfWriter()
     for p in pages_info:
         writer.add_page(reader.pages[p["index"]])
@@ -68,16 +84,20 @@ class PDFWorker(QThread):
     finished = pyqtSignal(list, str)
     error = pyqtSignal(str)
 
-    def __init__(self, file_path):
+    def __init__(self, file_path, crop_bottom):
         super().__init__()
         self.file_path = file_path
-
+        self.crop_bottom = crop_bottom
+        
     def run(self):
         try:
-            pages_info, output_path = sort_pdf_pages_and_count_sku(self.file_path)
+            pages_info, output_path = sort_pdf_pages_and_count_sku(
+                self.file_path, self.crop_bottom
+            )
             self.finished.emit(pages_info, output_path)
         except Exception as e:
             self.error.emit(str(e))
+
 
 # ------------------ GUI ------------------
 class PDFSorter(QWidget):
@@ -87,43 +107,65 @@ class PDFSorter(QWidget):
         self.pages_info = []
         self.sorted_pdf_path = ""
         self.doc_name = ""
+        self.pdf_path = None  # ⚡ Spremamo odabrani PDF
         self.initUI()
+        self.debug_win = debug_window
 
     def initUI(self):
         self.setWindowTitle("Sortiranje PDF in Pickup lista")
-        self.resize(700, 600)
+        self.resize(700, 650)
 
         main_layout = QVBoxLayout()
 
-        # Status label
+        # Status
         self.status = QLabel("Izberi PDF datoteko za sortiranje:")
         self.status.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(self.status)
 
-        # Dugme za sortiranje
-        self.sort_button = QPushButton("📂 Izberi PDF in sortiraj")
-        self.sort_button.clicked.connect(self.select_pdf)
+        # Odabir PDF dugme
+        self.load_pdf_button = QPushButton("📂 Izberi PDF")
+        self.load_pdf_button.clicked.connect(self.load_pdf)
+        main_layout.addWidget(self.load_pdf_button)
+
+        # Crop input
+        crop_layout = QHBoxLayout()
+        crop_label = QLabel("Capture:")
+        self.crop_input = QTextEdit()
+        self.crop_input.setFixedHeight(30)
+        self.crop_input.setText("50")
+        self.crop_input.textChanged.connect(self.update_preview)
+        crop_layout.addWidget(crop_label)
+        crop_layout.addWidget(self.crop_input)
+        main_layout.addLayout(crop_layout)
+
+        # PDF preview label
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.preview_label)
+
+        # Sort dugme
+        self.sort_button = QPushButton("⚡ Sortiraj PDF")
+        self.sort_button.clicked.connect(self.start_sort)
+        self.sort_button.setEnabled(False)  # aktivira se nakon odabira PDF
         main_layout.addWidget(self.sort_button)
 
-        # Text preview za pickup listu (HTML)
+        # Pickup lista HTML
         self.preview = QTextEdit()
         self.preview.setReadOnly(True)
         main_layout.addWidget(self.preview)
 
-        # Dugme za print pickup liste
+        # Print dugme
         self.print_pick_button = QPushButton("🖨️ Natisni Pickup listo")
         self.print_pick_button.clicked.connect(self.print_pick_list)
         main_layout.addWidget(self.print_pick_button)
 
-        # Developer linkovi
+        # Linkovi
         link_layout = QHBoxLayout()
         link_layout.addStretch()
         self.link_label = QLabel()
         self.link_label.setText(
-            '<a href="https://www.linkedin.com/in/ramotoric/" style="text-decoration:none;">'
-            '<span style="color:#0077b5;">LinkedIn</span></a>  |  '
-            '<a href="https://github.com/5H4" style="text-decoration:none;">'
-            '<span style="color:#333;">GitHub</span></a>'
+            '<a href="https://www.linkedin.com/in/ramotoric/">LinkedIn</a> | '
+            '<a href="https://github.com/5H4">GitHub</a>'
         )
         self.link_label.setOpenExternalLinks(True)
         link_layout.addWidget(self.link_label)
@@ -131,19 +173,66 @@ class PDFSorter(QWidget):
 
         self.setLayout(main_layout)
 
-    def select_pdf(self):
+    # ------------------ Odabir PDF ------------------
+    def load_pdf(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Izberi PDF datoteko", "", "PDF datoteke (*.pdf)"
+            self, "Izberi PDF", "", "PDF datoteke (*.pdf)"
         )
         if file_path:
+            self.pdf_path = file_path
             self.doc_name = os.path.basename(file_path)
-            self.status.setText("⏳ Sortiram PDF... prosim počakaj...")
-            self.sort_button.setEnabled(False)
-            self.worker = PDFWorker(file_path)
-            self.worker.finished.connect(self.on_sort_done)
-            self.worker.error.connect(self.on_sort_error)
-            self.worker.start()
+            self.sort_button.setEnabled(True)
+            self.update_preview()  # odmah pokaži preview
 
+    # ------------------ Preview update ------------------
+    def update_preview(self):
+        if not self.pdf_path:
+            return
+        try:
+            crop_value = int(self.crop_input.toPlainText().strip())
+        except ValueError:
+            crop_value = 50
+        self.add_pdf_preview(self.pdf_path, crop_value)
+
+    # ------------------ PDF Preview ------------------
+    def add_pdf_preview(self, file_path, crop_bottom):
+        doc = fitz.open(file_path)
+        page = doc.load_page(0)
+        pix = page.get_pixmap()
+        img_bytes = pix.tobytes("ppm")
+
+        qimg = QImage.fromData(img_bytes)
+        pixmap = QPixmap.fromImage(qimg)
+
+        painter = QPainter(pixmap)
+        pen = QPen(QColor(255, 0, 0))
+        pen.setWidth(4)
+        painter.setPen(pen)
+
+        y = pixmap.height() - crop_bottom
+        painter.drawLine(0, y, pixmap.width(), y)
+        painter.end()
+
+        self.preview_label.setPixmap(pixmap)
+        self.preview_label.setFixedHeight(300)
+        self.preview_label.setScaledContents(True)
+
+    # ------------------ Start sorting ------------------
+    def start_sort(self):
+        if not self.pdf_path:
+            return
+        self.status.setText("⏳ Sortiram PDF... prosim počakaj...")
+        self.sort_button.setEnabled(False)
+        try:
+            crop_value = int(self.crop_input.toPlainText().strip())
+        except ValueError:
+            crop_value = 50
+        self.worker = PDFWorker(self.pdf_path, crop_value)
+        self.worker.finished.connect(self.on_sort_done)
+        self.worker.error.connect(self.on_sort_error)
+        self.worker.start()
+
+    # ------------------ Sorting callbacks ------------------
     def on_sort_done(self, pages_info, sorted_pdf_path):
         self.pages_info = pages_info
         self.sorted_pdf_path = sorted_pdf_path
@@ -151,7 +240,6 @@ class PDFSorter(QWidget):
         self.sort_button.setEnabled(True)
         self.show_pick_list_html()
 
-        # Ponudi opciju za print sortirani PDF
         reply = QMessageBox.question(
             self, "PDF Sortiran", "Ali želite natisniti sortirani PDF?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
@@ -163,10 +251,10 @@ class PDFSorter(QWidget):
         self.status.setText(f"❌ Napaka: {error_message}")
         self.sort_button.setEnabled(True)
 
+    # ------------------ Pickup lista ------------------
     def show_pick_list_html(self):
         if not self.pages_info:
             return
-
         total_counts = defaultdict(int)
         for page in self.pages_info:
             sku_str = page["sku"]
@@ -181,19 +269,16 @@ class PDFSorter(QWidget):
         sorted_items = sorted(total_counts.items(), key=lambda x: x[1], reverse=True)
 
         html = f"<h2>Pickup lista za dokument: {self.doc_name}</h2>"
-        html += """
-        <table border="1" cellspacing="0" cellpadding="4">
+        html += """<table border="1" cellspacing="0" cellpadding="4">
         <tr style="background-color: #d3d3d3;">
-            <th>Št.</th>
-            <th>SKU</th>
-            <th>Količina</th>
-        </tr>
-        """
+        <th>Št.</th><th>SKU</th><th>Količina</th></tr>"""
         for i, (sku, qty) in enumerate(sorted_items, 1):
             html += f"<tr><td>{i}</td><td>{sku}</td><td>{qty}</td></tr>"
         html += "</table>"
+
         self.preview.setHtml(html)
 
+    # ------------------ Print funkcije ------------------
     def print_pick_list(self):
         if self.preview.toPlainText().strip() == "":
             return
@@ -208,7 +293,6 @@ class PDFSorter(QWidget):
             printer = QPrinter()
             dialog = QPrintDialog(printer, self)
             if dialog.exec_() == QPrintDialog.Accepted:
-                # sistemski print na odabrani printer
                 if sys.platform.startswith('linux'):
                     os.system(f"lp '{pdf_path}'")
                 elif sys.platform == 'win32':
@@ -219,9 +303,26 @@ class PDFSorter(QWidget):
         except Exception as e:
             self.status.setText(f"❌ Napaka pri tiskanju PDF: {str(e)}")
 
-# ------------------ Pokreni GUI ------------------
+    def moveEvent(self, event):
+        if self.debug_win:
+            self.debug_win.move(self.x() + self.width() + 10, self.y())
+        super().moveEvent(event)
+
+
+# ------------------ RUN ------------------
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     ex = PDFSorter()
     ex.show()
+
+    debug_window = DebugWindow()
+    debug_window.setWindowFlags(debug_window.windowFlags() | Qt.WindowStaysOnTopHint)
+    debug_window.show()
+    debug_window.raise_()
+    debug_window.activateWindow()
+    debug_window.move(ex.x() + ex.width() + 10, ex.y())
+
+    debug_signal.new_message.connect(debug_window.log)
+    ex.debug_win = debug_window
+
     sys.exit(app.exec_())
