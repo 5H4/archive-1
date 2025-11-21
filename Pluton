@@ -69,6 +69,12 @@ def sort_pdf_pages_and_count_sku(input_path, crop_bottom=50):
     sku_counter = Counter(p["sku"] for p in pages_info)
     pages_info.sort(key=lambda p: (sku_counter[p["sku"]], p["sku"]), reverse=True)
 
+
+    # ⚡ Debug: ispis sortirane liste u debug prozor
+    debug_signal.new_message.emit("####################### 📄 Sorted #######################")
+    for p in pages_info:
+        debug_signal.new_message.emit(f"SKU: [{p['sku']}]")
+
     writer = PdfWriter()
     for p in pages_info:
         writer.add_page(reader.pages[p["index"]])
